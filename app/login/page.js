@@ -18,7 +18,7 @@ export default function LoginPage() {
         setLoading(true);
 
         try {
-            if (username === "admin" && password === "admin123") {
+            if (username === "tglive#123" && password === "Trans@2026") {
                 // Store authentication cookie
                 document.cookie = "market_auth=true; path=/; max-age=86400; SameSite=Lax";
                 router.replace("/dashboard");
