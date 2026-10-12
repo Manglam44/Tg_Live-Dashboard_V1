@@ -1,0 +1,152 @@
+.panel {
+    --bg: #131722;
+    --tile: #1e222d;
+    --fg: #d1d4dc;
+    --muted: #787b86;
+    --bd: #2a2e39;
+    --accent: #2962ff;
+
+    width: 100%;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--bd);
+    border-radius: 6px;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, Ubuntu, sans-serif;
+}
+
+.panel[data-theme="light"] {
+    --bg: #ffffff;
+    --tile: #f0f3fa;
+    --fg: #131722;
+    --bd: #e0e3eb;
+}
+
+.head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px 24px;
+    margin-bottom: 16px;
+}
+
+.title {
+    margin: 0 0 8px;
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.2;
+}
+
+.badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.badge,
+.liveBadge {
+    padding: 2px 8px;
+    border: 1px solid var(--bd);
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.liveBadge {
+    color: #26a69a;
+    border-color: #26a69a;
+}
+
+.price {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+}
+
+.last {
+    font-size: 30px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+    transition: color 0.2s;
+}
+
+.up {
+    color: #26a69a;
+}
+
+.down {
+    color: #ef5350;
+}
+
+.muted {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.error {
+    margin: 0 0 12px;
+    color: #ef5350;
+}
+
+.quotes {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+    background: var(--tile);
+    border-radius: 6px;
+}
+
+.value {
+    font-size: 18px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.label {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px 24px;
+    margin: 0;
+    padding-top: 16px;
+    border-top: 1px solid var(--bd);
+}
+
+.item {
+    min-width: 0;
+}
+
+.dd {
+    margin: 2px 0 0;
+    overflow-wrap: anywhere;
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 560px) {
+    .price {
+        align-items: flex-start;
+    }
+
+    .last {
+        font-size: 26px;
+    }
+
+    .quotes {
+        grid-template-columns: 1fr;
+    }
+}

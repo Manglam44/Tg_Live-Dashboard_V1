@@ -1,83 +1,468 @@
 "use client";
 
-import { useMemo, useState } from "react";
 import {
+    Activity,
     BarChart3,
-    Clock3,
-    LogOut,
+    Flame, Layers,
+    LineChart,
+    LogOut, Moon,
     RefreshCw,
     Search,
-    Settings2,
-    CircleDollarSign,
-    TrendingUp,
-    ChevronRight,
+    Sun,
+    Zap
 } from "lucide-react";
 import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { displaySymbol, keyOf } from "@/lib/types";
-import type { MarketQuote } from "@/lib/types";
-import { COMMODITY_ORDER, CURRENCY_ORDER } from "@/lib/dashboard/constants";
-import { formatExpiry, formatSize, formatTime, instrumentLabel } from "@/lib/dashboard/format";
-import { cx } from "@/lib/dashboard/theme";
+import TradingChart from "@/components/TradingChart/TradingChart";
+import { useLiveCandle } from "@/hooks/useLiveCandle";
 import { useMarketQuotes } from "@/hooks/useMarketQuotes";
-import { Badge, PriceValue, SummaryCard, getInstrumentIcon } from "@/components/dashboard/primitives";
-import { LiveDataAlertModal } from "@/components/dashboard/LiveDataAlertModal";
+import { normalizeCandles, type Candle, type Interval, type RawRow } from "@/lib/chart-data";
+import { COMMODITY_ORDER } from "@/lib/dashboard/constants";
+import { formatSize } from "@/lib/dashboard/format";
+import type { MarketQuote } from "@/lib/types";
+import { displaySymbol, keyOf } from "@/lib/types";
 
-type MarketTab = "commodity" | "currency";
-type MarketMode = "live" | "delayed";
-type InstrumentFilter = "all" | "spot" | "future" | "option";
+/* ================================================================
+ * Types & category config
+ * ================================================================ */
+type Theme = "dark" | "light";
+type Category = "all" | "energy" | "metals" | "agriculture" | "softs" | "livestock" | "other";
 
+const CATEGORY_MAP: Record<Exclude<Category, "all" | "other">, string[]> = {
+    energy: ["CL", "BZ", "NG", "HO", "RB"],
+    metals: ["GC", "SI", "HG", "PL", "PA"],
+    agriculture: ["ZC", "ZS", "ZW", "ZM", "ZL", "KE", "MWE"],
+    softs: ["KC", "SB", "CC", "CT", "OJ"],
+    livestock: ["LE", "HE", "GF"],
+};
+const CATEGORY_META: Record<Category, { label: string; icon: typeof Flame; color: string }> = {
+    all: { label: "All", icon: Layers, color: "#787b86" },
+    energy: { label: "Energy", icon: Flame, color: "#f5a623" },
+    metals: { label: "Metals", icon: Zap, color: "#4c8dff" },
+    agriculture: { label: "Agri", icon: Activity, color: "#089981" },
+    softs: { label: "Softs", icon: LineChart, color: "#b48cff" },
+    livestock: { label: "Livestock", icon: BarChart3, color: "#f23645" },
+    other: { label: "Other", icon: Layers, color: "#787b86" },
+};
+const PILLS: Category[] = ["all", "metals", "agriculture"];
+
+function getCategory(symbol?: string | null): Category {
+    const s = symbol?.toUpperCase();
+    if (!s) return "other";
+    for (const [cat, list] of Object.entries(CATEGORY_MAP)) if (list.includes(s)) return cat as Category;
+    return "other";
+}
+
+/* ================================================================
+ * Contract month helpers
+ * ================================================================ */
+const MONTH_CODES = "FGHJKMNQUVXZ";
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function contractInfo(expiry?: string | null) {
+    const s = (expiry ?? "").replace(/\D/g, "");
+    if (s.length < 6) return null;
+    const y = Number(s.slice(0, 4));
+    const m = Number(s.slice(4, 6));
+    if (!y || m < 1 || m > 12) return null;
+    const d = s.length >= 8 ? Number(s.slice(6, 8)) : null;
+    return {
+        long: `${MONTHS[m - 1]} ${y}`,
+        short: `${MONTHS[m - 1]} ${String(y).slice(-2)}`,
+        code: `${MONTH_CODES[m - 1]}${String(y).slice(-2)}`,
+        date: d ? `${String(d).padStart(2, "0")} ${MONTHS[m - 1]} ${y}` : null,
+    };
+}
+
+/* ================================================================
+ * Enrichment
+ * ================================================================ */
+type EnrichedQuote = MarketQuote & {
+    _change: number | null; _changePct: number | null; _prev: number | null;
+    _open: number | null; _high: number | null; _low: number | null; _volume: number | null;
+};
+// Accepts real numbers AND numeric strings ("-45.4", "1,234.5") — feeds/Postgres often send strings.
+const num = (v: unknown): number | null => {
+    if (typeof v === "number") return isFinite(v) ? v : null;
+    if (typeof v === "string" && v.trim() !== "") {
+        const n = Number(v.replace(/,/g, "").replace(/%$/, ""));
+        return isFinite(n) ? n : null;
+    }
+    return null;
+};
+
+/** Session stats from /api/market/stats (feed has no open/high/low/prev close/volume). */
+type SessionStat = {
+    open: number | null; high: number | null; low: number | null; volume: number | null; prev: number | null;
+};
+
+function enrichQuote(q: MarketQuote, st?: SessionStat): EnrichedQuote {
+    // case / underscore-insensitive field lookup: prev_close, prevClose, PrevClose -> "prevclose"
+    const norm = new Map<string, unknown>();
+    for (const [k, v] of Object.entries(q as unknown as Record<string, unknown>))
+        norm.set(k.toLowerCase().replace(/[^a-z0-9]/g, ""), v);
+    const pick = (...keys: string[]) => {
+        for (const k of keys) {
+            const n = num(norm.get(k));
+            if (n != null) return n;
+        }
+        return null;
+    };
+
+    const last = num(q.last);
+    const prev = pick("prevclose", "previousclose", "prevsettle", "prevsettlement", "previoussettlement",
+        "priorsettle", "settlement", "settle", "settlementprice", "close") ?? st?.prev ?? null;
+    const change = pick("change", "netchange", "netchg", "chg", "pricechange", "changevalue", "diff")
+        ?? (last != null && prev != null ? last - prev : null);
+    const pct = pick("changepct", "pctchange", "changepercent", "percentchange", "pchange", "chgpct", "netchangepct", "changepercentage")
+        ?? (change != null && prev ? (change / prev) * 100 : null);
+
+    // live price extends the stored session high / low between refreshes
+    const hi = pick("high", "dayhigh", "highprice") ?? st?.high ?? null;
+    const lo = pick("low", "daylow", "lowprice") ?? st?.low ?? null;
+    return {
+        ...q, _change: change, _changePct: pct, _prev: prev,
+        _open: pick("open", "openprice", "dayopen") ?? st?.open ?? null,
+        _high: hi != null && last != null ? Math.max(hi, last) : hi,
+        _low: lo != null && last != null ? Math.min(lo, last) : lo,
+        _volume: pick("volume", "vol", "totalvolume", "dayvolume") ?? st?.volume ?? null,
+    };
+}
+
+const DECIMALS = 2;
+const fmtNum = (v: number | null | undefined, d: number) =>
+    v == null ? "—" : v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const IST_FMT = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata", day: "2-digit", month: "short",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true,
+});
+/** quote_time carries the correct offset. ticker_time is UTC mislabelled "+05:30", so reinterpret it as UTC. */
+function quoteInstant(q: MarketQuote): Date | null {
+    const a = q as unknown as Record<string, unknown>;
+    let d: Date | null = null;
+    if (typeof a.quote_time === "string") d = new Date(a.quote_time);
+    else if (typeof a.ticker_time === "string")
+        d = new Date(a.ticker_time.replace(/([+-]\d{2}:\d{2}|Z)$/, "") + "Z");
+    return d && !isNaN(d.getTime()) ? d : null;
+}
+const fmtIst = (d: Date | null) => (d ? IST_FMT.format(d) : "—");
+const signOf = (c: number | null) => (c == null || c === 0 ? "" : c > 0 ? "+" : "−");
+
+/* ================================================================
+ * Theme (TradingView palette)
+ * ================================================================ */
+const THEME_CSS = `
+.mt-root[data-theme="dark"]{
+  --app:#131722; --panel:#131722; --panel-soft:#1e222d; --head:#1e222d;
+  --border:#2a2e39; --border-soft:rgba(42,46,57,.55);
+  --text:#d1d4dc; --muted:#b2b5be; --faint:#787b86; --hover:rgba(42,46,57,.7);
+  --up:#089981; --down:#f23645; --flat:#787b86; --accent:#2962ff;
+}
+.mt-root[data-theme="light"]{
+  --app:#ffffff; --panel:#ffffff; --panel-soft:#f8f9fd; --head:#f8f9fd;
+  --border:#e0e3eb; --border-soft:#eef0f5;
+  --text:#131722; --muted:#434651; --faint:#787b86; --hover:#f0f3fa;
+  --up:#089981; --down:#f23645; --flat:#787b86; --accent:#2962ff;
+}
+.mt-root{background:var(--app);color:var(--text)}
+.mt-scroll{scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+`;
+const tint = (c: string, pct = 14) => `color-mix(in srgb, ${c} ${pct}%, transparent)`;
+const dirColor = (c: number | null) => (c == null || c === 0 ? "var(--flat)" : c > 0 ? "var(--up)" : "var(--down)");
+
+/* ================================================================
+ * Chart (left)
+ * ================================================================ */
+function ChartPanel({ quote, theme, onThemeChange }: {
+    quote: EnrichedQuote; theme: Theme; onThemeChange: (t: Theme) => void;
+}) {
+    const symbol = quote.symbol ?? "";
+    const info = contractInfo(quote.expiry);
+    const title = `${quote.name || symbol}${info ? ` · ${info.long}` : ""}`;
+    const expiry = quote.expiry && /^\d{8}$/.test(quote.expiry) ? quote.expiry : null; // API expects YYYYMMDD
+
+    const [interval, setIntervalTf] = useState<Interval>("1D");
+    const [contract, setContract] = useState<string | null>(null);
+    const [data, setData] = useState<Candle[]>([]);
+    const [error, setError] = useState<string | null>(null);
+    const [loading, setLoading] = useState(false);
+
+    // history: refetch when contract or interval changes
+    useEffect(() => {
+        if (!symbol) return;
+        let cancelled = false;
+        setError(null);
+        setData([]);
+        setContract(null);
+        setLoading(true);
+
+        const params = new URLSearchParams({ symbol, interval });
+        if (expiry) params.set("expiry", expiry);
+
+        fetch(`/api/candles?${params}`)
+            .then(async (r) => {
+                if (!r.ok) {
+                    const body = await r.json().catch(() => ({}));
+                    throw new Error(body.detail ?? body.error ?? `HTTP ${r.status}`);
+                }
+                if (!cancelled) setContract(r.headers.get("x-contract-expiry"));
+                return r.json();
+            })
+            .then((rows: RawRow[]) => !cancelled && setData(normalizeCandles(rows)))
+            .catch((e: Error) => !cancelled && setError(e.message))
+            .finally(() => !cancelled && setLoading(false));
+
+        return () => { cancelled = true; };
+    }, [symbol, expiry, interval]);
+
+    // realtime candle for the same symbol / interval / contract
+    const { liveBar, status } = useLiveCandle({
+        symbol, interval, expiry: expiry ?? contract, enabled: data.length > 0,
+    });
+
+    return (
+        <div className="relative h-full min-h-0">
+            {loading && (
+                <div className="absolute right-4 top-14 z-10 text-[var(--faint)]">
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                </div>
+            )}
+            {error && (
+                <p role="alert" className="absolute bottom-3 left-3 z-10 max-w-[80%] rounded px-3 py-2 text-xs"
+                    style={{ color: "var(--down)", background: tint("var(--down)", 14) }}>
+                    Could not load chart data: {error}
+                </p>
+            )}
+            <TradingChart
+                key={`${symbol}-${expiry ?? "spot"}`}
+                symbol={title}
+                data={data}
+                interval={interval}
+                onIntervalChange={setIntervalTf}
+                liveBar={liveBar}
+                liveStatus={status}
+                theme={theme}
+                onThemeChange={onThemeChange}
+                height="100%"
+            />
+        </div>
+    );
+}
+
+/* ================================================================
+ * Watchlist row
+ * ================================================================ */
+const COLS = "grid-cols-[minmax(0,1fr)_76px_62px_66px]";
+
+function WatchRow({ quote, selected, onSelect }: { quote: EnrichedQuote; selected: boolean; onSelect: () => void }) {
+    const info = contractInfo(quote.expiry);
+    const cat = CATEGORY_META[getCategory(quote.symbol)];
+    const c = dirColor(quote._change);
+    const s = signOf(quote._change);
+    const name = quote.name || quote.underlying || displaySymbol(quote).toString();
+    const sub = [quote.symbol, info?.code, quote.exchange].filter(Boolean).join(" · ");
+
+    return (
+        <button
+            type="button"
+            onClick={onSelect}
+            aria-pressed={selected}
+            className={`grid w-full ${COLS} items-center gap-2 border-b border-[var(--border-soft)] px-3 py-1.5 text-left transition hover:bg-[var(--hover)]`}
+            style={selected ? { background: tint("var(--accent)", 14), boxShadow: "inset 0 0 0 1px var(--accent)" } : undefined}
+        >
+            <div className="flex min-w-0 items-center gap-2.5">
+                <span
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-bold"
+                    style={{ color: cat.color, background: tint(cat.color, 20) }}
+                >
+                    {(quote.symbol ?? "?").slice(0, 2).toUpperCase()}
+                </span>
+                <div className="min-w-0">
+                    <p className="flex items-baseline gap-1.5 text-[13px] font-semibold leading-tight">
+                        <span className="truncate uppercase">{name}</span>
+                        <span className="shrink-0 text-[11px] font-medium text-[var(--faint)]">
+                            {info ? info.short : quote.expiry || ""}
+                        </span>
+                    </p>
+                    <p className="truncate text-[10px] text-[var(--faint)]">{sub}</p>
+                </div>
+            </div>
+
+            <span className="text-right font-mono text-[13px] font-medium tabular-nums" style={{ color: c }}>
+                {fmtNum(quote.last, DECIMALS)}
+            </span>
+            <span className="text-right font-mono text-[12px] tabular-nums" style={{ color: c }}>
+                {quote._change == null ? "—" : `${s}${fmtNum(Math.abs(quote._change), DECIMALS)}`}
+            </span>
+            <span className="text-right font-mono text-[12px] tabular-nums" style={{ color: c }}>
+                {quote._changePct == null ? "—" : `${s}${Math.abs(quote._changePct).toFixed(2)}%`}
+            </span>
+        </button>
+    );
+}
+
+/* ================================================================
+ * Selected contract details (bottom 40%)
+ * ================================================================ */
+function Row({ k, v, color }: { k: string; v: string; color?: string }) {
+    return (
+        <div className="flex items-center justify-between border-b border-[var(--border-soft)] py-1.5">
+            <span className="text-[12px] text-[var(--faint)]">{k}</span>
+            <span className="font-mono text-[12px] font-medium tabular-nums" style={{ color }}>{v}</span>
+        </div>
+    );
+}
+
+function Details({ q, feedDown }: { q: EnrichedQuote; feedDown: boolean }) {
+    const info = contractInfo(q.expiry);
+    const d = DECIMALS;
+    const cat = CATEGORY_META[getCategory(q.symbol)];
+    const c = dirColor(q._change);
+    const s = signOf(q._change);
+    const name = q.name || q.underlying || displaySymbol(q).toString();
+    const type = (q.instrument_type ?? "future").toUpperCase();
+    const pos =
+        q._low != null && q._high != null && q.last != null && q._high > q._low
+            ? Math.max(0, Math.min(100, ((q.last - q._low) / (q._high - q._low)) * 100))
+            : null;
+
+    return (
+        <div className="px-4 py-3">
+            <div className="flex items-center gap-3">
+                <span
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-bold"
+                    style={{ color: cat.color, background: tint(cat.color, 20) }}
+                >
+                    {(q.symbol ?? "?").slice(0, 2).toUpperCase()}
+                </span>
+                <div className="min-w-0">
+                    <p className="truncate text-[15px] font-semibold uppercase leading-tight">
+                        {name}{info ? ` · ${info.short}` : ""}
+                    </p>
+                    <p className="truncate text-[11px] text-[var(--faint)]">
+                        {[q.symbol, info?.long, q.exchange, type].filter(Boolean).join(" · ")}
+                    </p>
+                </div>
+            </div>
+
+            <div className="mt-3 flex items-baseline gap-3">
+                <span className="font-mono text-[28px] font-semibold leading-none tabular-nums">{fmtNum(q.last, d)}</span>
+                <span className="font-mono text-[14px] font-medium tabular-nums" style={{ color: c }}>
+                    {q._change == null ? "—" : `${s}${fmtNum(Math.abs(q._change), d)}`}
+                    {q._changePct != null && <> &nbsp;{s}{Math.abs(q._changePct).toFixed(2)}%</>}
+                </span>
+            </div>
+            <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-[var(--faint)]">
+                <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ background: feedDown ? "var(--down)" : "var(--up)" }} />
+                {feedDown ? "Feed down" : "Live"} · Last update at {fmtIst(quoteInstant(q))} IST
+            </p>
+
+            {pos != null && (
+                <div className="mt-3">
+                    <div className="relative h-1 rounded-full bg-[var(--border)]">
+                        <span
+                            className="absolute top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[var(--panel)] bg-[var(--accent)]"
+                            style={{ left: `${pos}%` }}
+                        />
+                    </div>
+                    <div className="mt-1 flex justify-between font-mono text-[10px] text-[var(--faint)] tabular-nums">
+                        <span>{fmtNum(q._low, d)}</span><span>Day range</span><span>{fmtNum(q._high, d)}</span>
+                    </div>
+                </div>
+            )}
+
+            <div className="mt-2 grid grid-cols-2 gap-x-6">
+                <Row k="Bid" v={fmtNum(q.bid, d)} />
+                <Row k="Ask" v={fmtNum(q.ask, d)} />
+                <Row k="Bid size" v={formatSize(q.bid_size)} />
+                <Row k="Ask size" v={formatSize(q.ask_size)} />
+                <Row k="Open" v={fmtNum(q._open, d)} />
+                <Row k="Prev close" v={fmtNum(q._prev, d)} />
+                <Row k="Day high" v={fmtNum(q._high, d)} color="var(--up)" />
+                <Row k="Day low" v={fmtNum(q._low, d)} color="var(--down)" />
+                <Row k="Volume" v={q._volume == null ? "—" : formatSize(q._volume)} />
+                <Row k="Expiry" v={info?.date ?? q.expiry ?? "—"} />
+            </div>
+        </div>
+    );
+}
+
+/* ================================================================
+ * Main dashboard (commodities only)
+ * ================================================================ */
 export default function MarketDashboard() {
     const router = useRouter();
 
-    const [tab, setTab] = useState<MarketTab>("commodity");
-    const [mode, setMode] = useState<MarketMode>("live");
-    const [instrumentFilter, setInstrumentFilter] = useState<InstrumentFilter>("all");
+    const [theme, setTheme] = useState<Theme>("dark");
+    const [category, setCategory] = useState<Category>("all");
     const [query, setQuery] = useState("");
-    const [alertDismissed, setAlertDismissed] = useState(false);
+    const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
-    const commodity = useMarketQuotes("/api/market/commodity", mode, COMMODITY_ORDER);
-    const currency = useMarketQuotes("/api/market/currency", mode, CURRENCY_ORDER);
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem("mt-theme") as Theme | null;
+            if (saved === "dark" || saved === "light") return setTheme(saved);
+            if (window.matchMedia("(prefers-color-scheme: light)").matches) setTheme("light");
+        } catch { /* storage unavailable */ }
+    }, []);
+    const chooseTheme = useCallback((t: Theme) => {
+        setTheme(t);
+        try { localStorage.setItem("mt-theme", t); } catch { /* ignore */ }
+    }, []);
 
-    const active = tab === "commodity" ? commodity : currency;
+    const commodity = useMarketQuotes("/api/market/commodity", "live", COMMODITY_ORDER);
 
-    const filteredQuotes = useMemo(() => {
+    // session stats (open / high / low / prev close / volume) from QuestDB, refreshed every 10s
+    const [stats, setStats] = useState<Record<string, SessionStat>>({});
+    useEffect(() => {
+        let stop = false;
+        const load = async () => {
+            try {
+                const r = await fetch("/api/market/stats", { cache: "no-store" });
+                if (!r.ok) return;
+                const j = await r.json();
+                if (!stop) setStats(j.stats ?? {});
+            } catch { /* keep previous stats */ }
+        };
+        void load();
+        const id = setInterval(load, 10_000);
+        return () => { stop = true; clearInterval(id); };
+    }, []);
+
+    const enriched = useMemo(
+        () => commodity.quotes.map((q) => enrichQuote(q, stats[`${q.symbol}|${q.expiry}`])),
+        [commodity.quotes, stats],
+    );
+
+    // Flat list: fixed commodity order, contracts nearest-expiry first
+    const rows = useMemo(() => {
         const search = query.trim().toLowerCase();
+        const orderSrc = COMMODITY_ORDER as unknown as Array<string | { symbol?: string }>;
+        const order = new Map<string, number>();
+        orderSrc.forEach((o, i) => order.set(String(typeof o === "string" ? o : o?.symbol ?? "").toUpperCase(), i));
+        const rank = (sym?: string | null) => order.get((sym ?? "").toUpperCase()) ?? Number.MAX_SAFE_INTEGER;
 
-        return active.quotes.filter((quote) => {
-            const instrumentType = quote.instrument_type?.toLowerCase();
+        return enriched
+            .filter((q) => {
+                if (q.instrument_type?.toLowerCase() !== "future") return false;
+                if (category !== "all" && getCategory(q.symbol) !== category) return false;
+                if (!search) return true;
+                return [displaySymbol(q), q.name, q.symbol, q.pair, q.exchange, q.underlying, q.expiry, contractInfo(q.expiry)?.long]
+                    .filter(Boolean).join(" ").toLowerCase().includes(search);
+            })
+            .sort((a, b) =>
+                rank(a.symbol) - rank(b.symbol) ||
+                (a.name ?? "").localeCompare(b.name ?? "") ||
+                (a.expiry ?? "").localeCompare(b.expiry ?? ""));
+    }, [enriched, category, query]);
 
-            if (instrumentFilter !== "all" && instrumentType !== instrumentFilter) return false;
-            if (!search) return true;
+    const selected = useMemo(() => enriched.find((q) => keyOf(q) === selectedKey) ?? null, [enriched, selectedKey]);
 
-            const searchableText = [
-                displaySymbol(quote),
-                quote.name,
-                quote.symbol,
-                quote.pair,
-                quote.exchange,
-                quote.underlying,
-                quote.expiry,
-                quote.right,
-            ]
-                .filter(Boolean)
-                .join(" ")
-                .toLowerCase();
-
-            return searchableText.includes(search);
-        });
-    }, [active.quotes, instrumentFilter, query]);
-
-    const totalCount = active.quotes.length;
-    const spotCount = active.quotes.filter((q) => q.instrument_type === "spot").length;
-    const futureCount = active.quotes.filter((q) => q.instrument_type === "future").length;
-    const optionCount = active.quotes.filter((q) => q.instrument_type === "option").length;
-
-    const handleTab = (next: MarketTab) => {
-        setTab(next);
-        setInstrumentFilter("all");
-        setQuery("");
-    };
+    useEffect(() => {
+        if (selected || !rows.length) return;
+        setSelectedKey(keyOf(rows[0]));
+    }, [selected, rows]);
 
     const handleLogout = () => {
         document.cookie = "market_auth=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
@@ -85,363 +470,145 @@ export default function MarketDashboard() {
         router.refresh();
     };
 
-    const showAlert = active.liveDataDown && !alertDismissed;
+    const feedDown = Boolean(commodity.liveDataDown);
 
     return (
-        <main className={`min-h-screen ${cx.bgApp} ${cx.textPrimary}`}>
-            <LiveDataAlertModal
-                open={showAlert}
-                onSwitchToDelayed={() => {
-                    setMode("delayed");
-                    setAlertDismissed(true);
-                }}
-                onRetry={() => {
-                    active.refresh();
-                    setAlertDismissed(true);
-                }}
-                onDismiss={() => setAlertDismissed(true)}
-            />
+        <main data-theme={theme} className="mt-root flex min-h-screen flex-col lg:h-screen lg:overflow-hidden">
+            <style jsx global>{THEME_CSS}</style>
 
-            <div className="mx-auto max-w-[1800px] px-4 py-5 sm:px-6 lg:px-8">
-                {/* HEADER */}
-                <header className="mb-5">
-                    <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-                        <div className="flex items-center gap-3">
-                            <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-md border ${cx.border} ${cx.bgPanel}`}>
-                                <BarChart3 className={`h-5 w-5 ${cx.accentText}`} />
-                            </div>
-
-                            <div>
-                                <h1 className="text-xl font-semibold tracking-tight text-white sm:text-2xl">
-                                    TransGraph Market Dashboard
-                                </h1>
-                                <p className={`mt-0.5 text-xs sm:text-sm ${cx.textFaint}`}>Real-time market data</p>
-                            </div>
-                        </div>
-
-                        <div className="flex flex-wrap items-center gap-2">
-                            <div className={`flex items-center gap-2 rounded-md border ${cx.border} ${cx.bgPanel} px-3 py-2`}>
-                                {active.liveDataDown ? (
-                                    <>
-                                        <span className={`relative flex h-2 w-2 rounded-full ${cx.warnBg}`} />
-                                        <span className={`text-xs font-medium ${cx.warnText}`}>FEED DELAYED</span>
-                                    </>
-                                ) : (
-                                    <>
-                                        <span className="relative flex h-2 w-2">
-                                            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#089981] opacity-50" />
-                                            <span className="relative inline-flex h-2 w-2 rounded-full bg-[#089981]" />
-                                        </span>
-                                        <span className={`text-xs font-medium ${cx.up}`}>
-                                            {mode === "live" ? "LIVE" : "DELAYED"}
-                                        </span>
-                                    </>
-                                )}
-                            </div>
-
+            {/* ================= TOP BAR ================= */}
+            <header className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border)] px-3">
+                <div className="flex items-center gap-2.5">
+                    <BarChart3 className="h-5 w-5 text-[var(--accent)]" />
+                    <h1 className="text-[15px] font-semibold tracking-tight">TransGraph Live Quotes</h1>
+                </div>
+                <div className="flex items-center gap-2">
+                    <span
+                        className="flex h-8 items-center gap-2 rounded px-2.5 text-xs font-semibold"
+                        style={{ color: feedDown ? "var(--down)" : "var(--up)", background: tint(feedDown ? "var(--down)" : "var(--up)", 14) }}
+                        role="status"
+                    >
+                        <span className="relative flex h-2 w-2">
+                            {!feedDown && <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--up)] opacity-50" />}
+                            <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
+                        </span>
+                        {feedDown ? "Feed down" : "Live"}
+                    </span>
+                    <div className="inline-flex h-8 items-center rounded border border-[var(--border)] p-0.5" role="group" aria-label="Theme">
+                        {(["dark", "light"] as const).map((t) => (
                             <button
+                                key={t}
                                 type="button"
-                                onClick={active.refresh}
-                                disabled={active.refreshing}
-                                className={`inline-flex h-9 items-center gap-2 rounded-md border ${cx.border} ${cx.bgPanel} px-3 text-xs font-medium ${cx.textPrimary} transition hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-50`}
+                                onClick={() => chooseTheme(t)}
+                                aria-pressed={theme === t}
+                                title={`${t} theme`}
+                                className="flex h-7 w-7 items-center justify-center rounded transition"
+                                style={theme === t ? { background: tint("var(--accent)", 18), color: "var(--accent)" } : { color: "var(--faint)" }}
                             >
-                                <RefreshCw className={`h-3.5 w-3.5 ${active.refreshing ? "animate-spin" : ""}`} />
-                                Refresh
+                                {t === "dark" ? <Moon className="h-3.5 w-3.5" /> : <Sun className="h-3.5 w-3.5" />}
                             </button>
-
-                            <button
-                                type="button"
-                                onClick={handleLogout}
-                                className={`inline-flex h-9 items-center gap-2 rounded-md border ${cx.border} ${cx.bgPanel} px-3 text-xs font-medium text-[#f23645] transition hover:bg-white/[0.06]`}
-                            >
-                                <LogOut className="h-3.5 w-3.5" />
-                                Sign Out
-                            </button>
-                        </div>
+                        ))}
                     </div>
-                </header>
+                    <button type="button" onClick={handleLogout}
+                        className="inline-flex h-8 items-center gap-1.5 rounded border border-[var(--border)] px-2.5 text-xs font-medium text-[var(--down)] transition hover:bg-[var(--hover)]">
+                        <LogOut className="h-3.5 w-3.5" />
+                        <span className="hidden sm:inline">Sign out</span>
+                    </button>
+                </div>
+            </header>
 
-                {/* TOP NAV */}
-                <section className="mb-5">
-                    <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                        <div className={`inline-flex w-fit rounded-md border ${cx.border} ${cx.bgPanelSoft} p-1`}>
-                            {(["commodity", "currency"] as const).map((value) => (
-                                <button
-                                    key={value}
-                                    type="button"
-                                    onClick={() => handleTab(value)}
-                                    className={`rounded px-5 py-2.5 text-sm font-medium capitalize transition ${tab === value ? `${cx.bgPanel} text-white` : `${cx.textFaint} hover:text-slate-300`
-                                        }`}
-                                >
-                                    {value === "commodity" ? "Commodities" : "Currency"}
-                                </button>
-                            ))}
-                        </div>
-
-                        <div className={`inline-flex w-fit rounded-md border ${cx.border} ${cx.bgPanelSoft} p-1`}>
-                            <button
-                                type="button"
-                                onClick={() => setMode("live")}
-                                className={`rounded px-4 py-2 text-xs font-medium transition ${mode === "live" ? "bg-[#089981]/10 text-[#089981]" : `${cx.textFaint} hover:text-slate-300`
-                                    }`}
-                            >
-                                Live
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setMode("delayed")}
-                                className={`rounded px-4 py-2 text-xs font-medium transition ${mode === "delayed" ? "bg-[#f0a30a]/10 text-[#f0a30a]" : `${cx.textFaint} hover:text-slate-300`
-                                    }`}
-                            >
-                                Delayed
-                            </button>
-                        </div>
-                    </div>
-                </section>
-
-                {/* SUMMARY */}
-                <section className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
-                    <SummaryCard title="Instruments" value={totalCount} icon={BarChart3} description="Unique instruments" />
-                    <SummaryCard title="Spot" value={spotCount} icon={CircleDollarSign} description="Spot instruments" />
-                    <SummaryCard title="Futures" value={futureCount} icon={TrendingUp} description="Future contracts" />
-                    <SummaryCard title="Options" value={optionCount} icon={Settings2} description="Option contracts" />
-                </section>
-
-                {/* FILTERS */}
-                <section className={`mb-4 rounded-md border ${cx.border} ${cx.bgPanelSoft} p-3`}>
-                    <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                            {(
-                                [
-                                    ["all", "All"],
-                                    ["spot", "Spot"],
-                                    ["future", "Future"],
-                                    ["option", "Option"],
-                                ] as const
-                            ).map(([value, label]) => (
-                                <button
-                                    key={value}
-                                    type="button"
-                                    onClick={() => setInstrumentFilter(value)}
-                                    className={`rounded px-3 py-2 text-xs font-medium transition ${instrumentFilter === value
-                                        ? `${cx.bgPanel} text-white`
-                                        : `${cx.textFaint} hover:bg-white/5 hover:text-slate-300`
-                                        }`}
-                                >
-                                    {label}
-                                </button>
-                            ))}
-                        </div>
-
-                        <div className="relative w-full xl:max-w-sm">
-                            <Search className={`pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 ${cx.textFaint}`} />
-                            <input
-                                type="text"
-                                value={query}
-                                onChange={(event) => setQuery(event.target.value)}
-                                placeholder="Search instrument..."
-                                className={`h-10 w-full rounded-md border ${cx.border} bg-black/20 pl-9 pr-3 text-sm ${cx.textPrimary} outline-none placeholder:${cx.textFaint} focus:border-[#2962ff]/40 focus:ring-1 focus:ring-[#2962ff]/25`}
-                            />
-                        </div>
-                    </div>
-                </section>
-
-                {/* ERROR */}
-                {active.error && (
-                    <div className="mb-4 rounded-md border border-[#f23645]/25 bg-[#f23645]/[0.07] px-4 py-3">
-                        <p className="text-sm font-medium text-[#f23645]">Market data error</p>
-                        <p className="mt-1 text-xs text-[#f23645]/75">{active.error}</p>
-                    </div>
-                )}
-
-                {/* TABLE */}
-                <section className={`overflow-hidden rounded-md border ${cx.border} ${cx.bgPanelSoft}`}>
-                    <div className={`flex flex-col gap-2 border-b ${cx.border} px-4 py-4 sm:flex-row sm:items-center sm:justify-between`}>
-                        <div>
-                            <h2 className="text-sm font-semibold text-white">
-                                {tab === "commodity" ? "Commodity Market" : "Currency Market"}
-                            </h2>
-                            <p className={`mt-1 text-xs ${cx.textFaint}`}>{filteredQuotes.length} instruments</p>
-                        </div>
-
-                        <div className={`flex items-center gap-4 text-xs ${cx.textMuted}`}>
-                            <div className="flex items-center gap-1.5">
-                                <Clock3 className="h-3.5 w-3.5" />
-                                <span>Updated {active.updated ? formatTime(active.updated.toISOString()) : "—"}</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    {active.loading ? (
-                        <div className="flex min-h-[420px] items-center justify-center">
-                            <div className="flex flex-col items-center gap-3">
-                                <RefreshCw className={`h-6 w-6 animate-spin ${cx.textMuted}`} />
-                                <p className={`text-sm ${cx.textMuted}`}>Loading market data...</p>
-                            </div>
-                        </div>
-                    ) : filteredQuotes.length === 0 ? (
-                        <div className="flex min-h-[420px] items-center justify-center">
-                            <div className="text-center">
-                                <Search className={`mx-auto mb-3 h-6 w-6 ${cx.textFaint}`} />
-                                <h3 className="text-sm font-medium text-slate-300">No instruments found</h3>
-                                <p className={`mt-1 text-xs ${cx.textFaint}`}>Try another search or filter.</p>
-                            </div>
-                        </div>
+            {/* ================= BODY ================= */}
+            <div className="grid min-h-0 flex-1 grid-rows-[65vh_95vh] lg:grid-cols-[minmax(0,1fr)_440px] lg:grid-rows-1">
+                {/* ---------- LEFT: chart ---------- */}
+                <section className="min-h-0 min-w-0 border-[var(--border)] lg:border-r">
+                    {selected ? (
+                        <ChartPanel quote={selected} theme={theme} onThemeChange={chooseTheme} />
                     ) : (
-                        <div className="overflow-x-auto">
-                            <table className="w-full min-w-[1150px] border-collapse">
-                                <thead>
-                                    <tr className={`border-b ${cx.border} bg-black/10`}>
-                                        {["Instrument", "Type", "Exchange"].map((h) => (
-                                            <th key={h} className={`px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wider ${cx.textFaint}`}>
-                                                {h}
-                                            </th>
-                                        ))}
-                                        {["Bid", "Ask", "Last", "Bid Size", "Ask Size"].map((h) => (
-                                            <th key={h} className={`px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wider ${cx.textFaint}`}>
-                                                {h}
-                                            </th>
-                                        ))}
-                                        <th className={`px-4 py-3 text-left text-[10px] font-semibold uppercase tracking-wider ${cx.textFaint}`}>Contract</th>
-                                        <th className={`px-4 py-3 text-right text-[10px] font-semibold uppercase tracking-wider ${cx.textFaint}`}>Updated</th>
-                                        <th className="w-10 px-2 py-3" />
-                                    </tr>
-                                </thead>
-
-                                <tbody>
-                                    {filteredQuotes.map((quote) => (
-                                        <QuoteRow key={keyOf(quote)} quote={quote} mode={mode} onClick={() => navigateToDetail(router, quote, mode)} />
-                                    ))}
-                                </tbody>
-                            </table>
+                        <div className="flex h-full flex-col items-center justify-center text-center">
+                            <LineChart className="mb-3 h-6 w-6 text-[var(--faint)]" />
+                            <p className="text-sm font-medium">Select a contract</p>
+                            <p className="mt-1 text-xs text-[var(--faint)]">Pick an expiry from the list to open its live chart.</p>
                         </div>
                     )}
-
-                    <div className={`flex items-center gap-2 text-[11px] ${cx.textFaint}`}>
-                        <span className="relative flex h-2 w-2">
-                            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#089981] opacity-30" />
-                            <span className="relative inline-flex h-2 w-2 rounded-full bg-[#089981]/70" />
-                        </span>
-
-                        {mode === "live"
-                            ? "Live prices update in real time"
-                            : "Delayed prices update periodically"}
-                    </div>
                 </section>
+
+                {/* ---------- RIGHT: watchlist (60%) + details (40%) ---------- */}
+                <aside className="flex min-h-0 flex-col border-t border-[var(--border)] lg:border-t-0">
+                    {/* 60% — heading + listing */}
+                    <div className="flex h-[60%] min-h-0 flex-col border-b border-[var(--border)]">
+                        <div className="shrink-0 space-y-2 px-3 pb-2 pt-3">
+                            <div className="relative min-w-0">
+                                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--faint)]" />
+                                <input
+                                    type="text"
+                                    value={query}
+                                    onChange={(e) => setQuery(e.target.value)}
+                                    placeholder="Search..."
+                                    className="h-8 w-full rounded border border-[var(--border)] bg-[var(--panel-soft)] pl-8 pr-2 text-xs outline-none placeholder:text-[var(--faint)] focus:border-[var(--accent)]"
+                                />
+                            </div>
+
+                            <div className="flex flex-wrap gap-1.5">
+                                {PILLS.map((cat) => {
+                                    const on = category === cat;
+                                    return (
+                                        <button
+                                            key={cat}
+                                            type="button"
+                                            onClick={() => setCategory(cat)}
+                                            className="h-6 rounded-full px-2.5 text-[11px] font-medium transition"
+                                            style={on
+                                                ? { background: "var(--accent)", color: "#fff" }
+                                                : { background: "var(--panel-soft)", color: "var(--muted)" }}
+                                        >
+                                            {CATEGORY_META[cat].label}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </div>
+
+                        <div className={`grid ${COLS} shrink-0 gap-2 border-y border-[var(--border)] bg-[var(--head)] px-3 py-1.5 text-[11px] font-semibold text-[var(--faint)]`}>
+                            <span>Symbol <span className="font-normal">· {rows.length}</span></span>
+                            <span className="text-right">Last</span>
+                            <span className="text-right">Chg</span>
+                            <span className="text-right">Chg%</span>
+                        </div>
+
+                        {commodity.error && (
+                            <p className="shrink-0 px-3 py-1.5 text-xs text-[var(--down)]">Market data error: {commodity.error}</p>
+                        )}
+
+                        <div className="mt-scroll min-h-0 flex-1 overflow-y-auto">
+                            {commodity.loading ? (
+                                <div className="flex h-full min-h-[160px] flex-col items-center justify-center gap-2">
+                                    <RefreshCw className="h-5 w-5 animate-spin text-[var(--faint)]" />
+                                    <p className="text-xs text-[var(--faint)]">Loading market data...</p>
+                                </div>
+                            ) : rows.length === 0 ? (
+                                <div className="flex h-full min-h-[160px] flex-col items-center justify-center text-center">
+                                    <Search className="mb-2 h-5 w-5 text-[var(--faint)]" />
+                                    <p className="text-sm font-medium">No instruments found</p>
+                                    <p className="mt-1 text-xs text-[var(--faint)]">Change the category or clear the search.</p>
+                                </div>
+                            ) : (
+                                rows.map((q) => (
+                                    <WatchRow key={keyOf(q)} quote={q} selected={keyOf(q) === selectedKey} onSelect={() => setSelectedKey(keyOf(q))} />
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    {/* 40% — selected contract */}
+                    <div className="mt-scroll h-[40%] min-h-0 overflow-y-auto bg-[var(--panel)]">
+                        {selected ? (
+                            <Details q={selected} feedDown={feedDown} />
+                        ) : (
+                            <p className="p-4 text-xs text-[var(--faint)]">Select a contract to see its details.</p>
+                        )}
+                    </div>
+                </aside>
             </div>
         </main>
-    );
-}
-
-function navigateToDetail(
-    router: ReturnType<typeof useRouter>,
-    quote: MarketQuote,
-    mode: MarketMode
-) {
-    const params = new URLSearchParams();
-
-    params.set("name", quote.name ?? "");
-    params.set("symbol", quote.symbol ?? "");
-    params.set("mode", mode);
-    params.set("instrument_type", quote.instrument_type ?? "");
-
-    if (quote.expiry) params.set("expiry", quote.expiry);
-    if (quote.strike != null) params.set("strike", String(quote.strike));
-    if (quote.right) params.set("right", quote.right);
-
-    router.push(
-        `/market/${quote.asset_class}/${encodeURIComponent(
-            displaySymbol(quote)
-        )}?${params.toString()}`
-    );
-}
-
-function InstrumentIcon({
-    type,
-    className,
-}: {
-    type: string;
-    className?: string;
-}) {
-    const Icon = getInstrumentIcon(type);
-    return <Icon className={className} />;
-}
-
-function QuoteRow({ quote, mode, onClick }: { quote: MarketQuote; mode: MarketMode; onClick: () => void }) {
-    const type = quote.instrument_type;
-    const isCurrency = quote.asset_class === "currency";
-    const decimals = isCurrency ? 5 : 2;
-
-    return (
-        <tr onClick={onClick} className={`group cursor-pointer border-b ${cx.borderSoft} transition hover:bg-white/[0.04]`}>
-            <td className="px-4 py-4">
-                <div className="flex items-center gap-3">
-                    <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-md border ${cx.borderSoft} ${cx.bgPanel}`}>
-                        <InstrumentIcon
-                            type={quote.instrument_type}
-                            className={`h-4 w-4 ${cx.textMuted}`}
-                        />
-                    </div>
-
-                    <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                            <span className="font-semibold text-slate-100">{displaySymbol(quote)}</span>
-                            {mode === "live" && <Badge variant="live">LIVE</Badge>}
-                        </div>
-                        <p className={`mt-1 max-w-[220px] truncate text-xs ${cx.textFaint}`}>
-                            {quote.name || quote.underlying || "—"}
-                        </p>
-                    </div>
-                </div>
-            </td>
-
-            <td className="px-4 py-4">
-                <Badge variant={type === "future" ? "future" : type === "option" ? "option" : "spot"}>
-                    {instrumentLabel(type)}
-                </Badge>
-            </td>
-
-            <td className={`px-4 py-4 text-xs font-medium ${cx.textMuted}`}>{quote.exchange || "—"}</td>
-
-            <td className="px-4 py-4 text-right">
-                <PriceValue value={quote.bid} decimals={decimals} />
-            </td>
-            <td className="px-4 py-4 text-right">
-                <PriceValue value={quote.ask} decimals={decimals} />
-            </td>
-            <td className="px-4 py-4 text-right">
-                <PriceValue value={quote.last} decimals={decimals} />
-            </td>
-
-            <td className={`px-4 py-4 text-right font-mono text-xs tabular-nums ${cx.textMuted}`}>{formatSize(quote.bid_size)}</td>
-            <td className={`px-4 py-4 text-right font-mono text-xs tabular-nums ${cx.textMuted}`}>{formatSize(quote.ask_size)}</td>
-
-            <td className="px-4 py-4">
-                {type === "future" && (
-                    <div>
-                        <p className="font-mono text-xs text-slate-300">{formatExpiry(quote.expiry) || "—"}</p>
-                        <p className={`mt-1 text-[10px] ${cx.textFaint}`}>Expiry</p>
-                    </div>
-                )}
-
-                {type === "option" && (
-                    <div>
-                        <div className="flex items-center gap-2">
-                            <span className="font-mono text-xs text-slate-300">{quote.expiry || "—"}</span>
-                            {quote.right && <Badge variant="option">{quote.right}</Badge>}
-                        </div>
-                        <p className={`mt-1 text-[10px] ${cx.textFaint}`}>Strike {quote.strike ?? "—"}</p>
-                    </div>
-                )}
-
-                {type === "spot" && <span className={`text-xs ${cx.textFaint}`}>Spot</span>}
-            </td>
-
-            <td className={`px-4 py-4 text-right font-mono text-[11px] tabular-nums ${cx.textFaint}`}>{formatTime(quote?.ticker_time)}</td>
-
-            <td className="px-2 py-4">
-                <ChevronRight className={`h-4 w-4 ${cx.textFaint} transition group-hover:translate-x-0.5 group-hover:text-slate-300`} />
-            </td>
-        </tr>
     );
 }

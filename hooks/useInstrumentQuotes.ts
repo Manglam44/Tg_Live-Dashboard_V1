@@ -103,12 +103,12 @@ export function useInstrumentQuotes(
                         const nameMatches =
                             !selector.commodityName ||
                             String(quote.name ?? "").toUpperCase() ===
-                                selector.commodityName.toUpperCase();
+                            selector.commodityName.toUpperCase();
 
                         const symbolMatches =
                             !selector.symbol ||
                             String(quote.symbol ?? "").toUpperCase() ===
-                                selector.symbol.toUpperCase();
+                            selector.symbol.toUpperCase();
 
                         const typeMatches =
                             !selector.instrumentType ||
@@ -120,10 +120,10 @@ export function useInstrumentQuotes(
                     const selected = selector.instrument.toUpperCase();
                     const symbol = String(
                         quote.symbol ??
-                            quote.pair ??
-                            quote.name ??
-                            quote.underlying ??
-                            ""
+                        quote.pair ??
+                        quote.name ??
+                        quote.underlying ??
+                        ""
                     ).toUpperCase();
 
                     const symbolMatches =

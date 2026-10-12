@@ -5,12 +5,9 @@
  * timeout handling and error formatting remain consistent.
  */
 
-const FASTAPI_BASE_URL =
-    process.env.FASTAPI_BASE_URL ??
-    "http://127.0.0.1:8000";
+const FASTAPI_BASE_URL = process.env.NEXT_FASTAPI_BASE_URL ?? "http://13.233.120.152:8000";
 
-const FASTAPI_API_KEY =
-    process.env.FASTAPI_API_KEY;
+const FASTAPI_API_KEY = process.env.NEXT_PUBLIC_FASTAPI_API_KEY ?? process.env.MARKET_API_KEY;
 
 const DEFAULT_TIMEOUT_MS = 12000;
 
@@ -32,7 +29,7 @@ if (
     process.env.NODE_ENV !== "production"
 ) {
     console.warn(
-        "[fastapi-client] FASTAPI_API_KEY is not set."
+        "[fastapi-client] FASTAPI_API_KEY / MARKET_API_KEY is not set."
     );
 }
 
@@ -65,10 +62,7 @@ export async function fastapiGet<T>(
     const controller =
         new AbortController();
 
-    const timeout = setTimeout(
-        () => controller.abort(),
-        timeoutMs
-    );
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
         const response = await fetch(
@@ -78,29 +72,20 @@ export async function fastapiGet<T>(
                 cache: "no-store",
                 signal: controller.signal,
                 headers: {
-                    Accept:
-                        "application/json",
-                    ...(FASTAPI_API_KEY
-                        ? {
-                              "X-API-Key":
-                                  FASTAPI_API_KEY,
-                          }
-                        : {}),
+                    Accept: "application/json",
+                    ...(
+                        FASTAPI_API_KEY ? { "X-API-Key": FASTAPI_API_KEY, }
+                            : {}),
                 },
             }
         );
 
         if (!response.ok) {
-            const body =
-                await response
-                    .text()
-                    .catch(() => "");
-
+            const body = await response.text().catch(() => "");
             throw new FastApiError(
-                `FastAPI ${path} returned ${response.status}${
-                    body
-                        ? `: ${body}`
-                        : ""
+                `FastAPI ${path} returned ${response.status}${body
+                    ? `: ${body}`
+                    : ""
                 }`,
                 response.status
             );
@@ -123,10 +108,9 @@ export async function fastapiGet<T>(
         }
 
         throw new FastApiError(
-            `FastAPI ${path} request failed: ${
-                err instanceof Error
-                    ? err.message
-                    : String(err)
+            `FastAPI ${path} request failed: ${err instanceof Error
+                ? err.message
+                : String(err)
             }`,
             502
         );

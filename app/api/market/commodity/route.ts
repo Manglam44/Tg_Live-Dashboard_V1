@@ -23,10 +23,7 @@ function parseLimit(value: string | null): number {
         return 500;
     }
 
-    return Math.min(
-        5000,
-        Math.max(1, Math.trunc(parsed))
-    );
+    return Math.min(200, Math.max(1, Math.trunc(parsed)));
 }
 
 export async function GET(
@@ -35,20 +32,15 @@ export async function GET(
     const searchParams =
         request.nextUrl.searchParams;
 
-    const mode = parseMode(
-        searchParams.get("mode")
-    );
+    const mode = parseMode(searchParams.get("mode"));
 
-    const limit = parseLimit(
-        searchParams.get("limit")
-    );
+    const limit = parseLimit(searchParams.get("limit"));
 
     try {
-        const quotes =
-            await getCommodityQuotes(
-                mode,
-                limit
-            );
+        const quotes = await getCommodityQuotes(
+            mode,
+            limit
+        );
 
         return NextResponse.json(
             quotes,

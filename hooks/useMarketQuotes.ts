@@ -31,7 +31,8 @@ interface UseMarketQuotesResult {
 export function useMarketQuotes(
     endpoint: string,
     mode: Mode,
-    order: readonly string[]
+    order: readonly string[],
+    enabled = true
 ): UseMarketQuotesResult {
     const [quotes, setQuotes] = useState<MarketQuote[]>([]);
     const [loading, setLoading] = useState(true);
@@ -46,6 +47,8 @@ export function useMarketQuotes(
 
     const load = useCallback(
         async (initial = false) => {
+            if (!enabled) return;
+
             // Never start another poll while the previous request is still running.
             // This prevents the one-second timer from creating a cancellation loop.
             if (inFlight.current) return;
@@ -65,7 +68,7 @@ export function useMarketQuotes(
 
                 const params = new URLSearchParams({
                     mode,
-                    limit: "500",
+                    limit: "5000",
                 });
 
                 const response = await fetch(
@@ -89,8 +92,7 @@ export function useMarketQuotes(
                 }
 
                 const unique = deduplicateQuotes(data);
-                const stale =
-                    mode === "live" && isStale(unique, STALE_QUOTE_MS);
+                const stale = mode === "live" && isStale(unique, STALE_QUOTE_MS);
 
                 if (mode === "live" && (unique.length === 0 || stale)) {
                     failureStreak.current += 1;
@@ -132,10 +134,11 @@ export function useMarketQuotes(
                 setRefreshing(false);
             }
         },
-        [endpoint, mode, order]
+        [endpoint, mode, order, enabled]
     );
 
     useEffect(() => {
+        if (!enabled) return;
         failureStreak.current = 0;
         void load(true);
 
@@ -144,15 +147,16 @@ export function useMarketQuotes(
             controllerRef.current = null;
             inFlight.current = false;
         };
-    }, [load]);
+    }, [load, enabled]);
 
     useEffect(() => {
+        if (!enabled) return;
         const interval = window.setInterval(() => {
             void load(false);
         }, REFRESH_INTERVAL_MS);
 
         return () => window.clearInterval(interval);
-    }, [load]);
+    }, [load, enabled]);
 
     return {
         quotes,
