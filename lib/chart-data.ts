@@ -102,3 +102,14 @@ export function generateMockCandles(interval: Interval | string = "1D", count = 
     }
     return out;
 }
+
+export const INTERVAL_META = {
+  "1s": { label: "1 second", short: "1s", group: "seconds" },
+  "1m": { label: "1 minute", short: "1m", group: "minutes" },
+  "5m": { label: "5 minutes", short: "5m", group: "minutes" },
+  "15m": { label: "15 minutes", short: "15m", group: "minutes" },
+  "1h": { label: "1 hour", short: "1H", group: "hours" },
+  "4h": { label: "4 hours", short: "4H", group: "hours" },
+  "1D": { label: "1 day", short: "1D", group: "days" },
+  "1W": { label: "1 week", short: "1W", group: "days" },
+} as const;

@@ -363,24 +363,19 @@ export default function InstrumentPriceChart({
 
             xAxis: {
                 type: "time",
-
-                boundaryGap: false,
-
+                // boundaryGap: false,
                 axisLine: {
                     lineStyle: {
                         color: "#e5e7eb",
                     },
                 },
-
                 axisTick: {
                     show: false,
                 },
-
                 axisLabel: {
                     color: "#6b7280",
                     fontSize: 11,
                 },
-
                 splitLine: {
                     show: true,
                     lineStyle: {

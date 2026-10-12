@@ -4,9 +4,19 @@ import TradingChart from "@/components/TradingChart/TradingChart";
 import { normalizeCandles, type Candle, type RawRow } from "@/lib/chart-data";
 import { useEffect, useState } from "react";
 
+type ChartInterval =
+    | "1s"
+    | "1m"
+    | "5m"
+    | "15m"
+    | "1h"
+    | "4h"
+    | "1D"
+    | "1W";
+
 export default function ChartPage() {
     const symbol = "ZM";
-    const [interval, setIntervalTf] = useState("1D");
+    const [interval, setIntervalTf] = useState<ChartInterval>("1D");
     const [expiry, setExpiry] = useState(null);
     const [data, setData] = useState<Candle[]>([]);
     const [error, setError] = useState<string | null>(null);
